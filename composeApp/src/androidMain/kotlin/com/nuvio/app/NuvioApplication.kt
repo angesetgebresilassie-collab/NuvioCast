@@ -13,6 +13,7 @@ import coil3.request.crossfade
 import coil3.svg.SvgDecoder
 import com.nuvio.app.core.network.NetworkErrorInterceptor
 import com.nuvio.app.core.poster.CustomPosterFallbackInterceptor
+import com.nuvio.app.features.cast.CastManager
 import com.nuvio.app.features.servers.plex.PlexArtworkInterceptor
 import com.nuvio.app.features.servers.silo.SiloArtworkInterceptor
 import io.ktor.client.HttpClient
@@ -25,6 +26,11 @@ import io.ktor.client.engine.okhttp.OkHttp
  * before MainActivity.onCreate, and interceptors registered later are ignored.
  */
 class NuvioApplication : Application(), SingletonImageLoader.Factory {
+
+    override fun onCreate() {
+        super.onCreate()
+        CastManager.init(this)
+    }
 
     override fun newImageLoader(context: android.content.Context): ImageLoader {
         return ImageLoader.Builder(context)
