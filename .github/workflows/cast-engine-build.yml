@@ -18,10 +18,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # No submodules: MPVKit is iOS-only and libass-android is an orphan
+      # gitlink (no .gitmodules entry) that breaks a recursive checkout.
       - name: Checkout
         uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
       - name: Set up Java
         uses: actions/setup-java@v5
