@@ -196,5 +196,7 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
             partyPanelInset = partyPanelInset,
             dockPartyPanel = dockPartyPanel,
         )
+        // Cast button + popup (UPnP/DLNA), drawn above the player UI.
+        runtime.RenderCastOverlay()
     }
 }
