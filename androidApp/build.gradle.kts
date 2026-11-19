@@ -49,6 +49,17 @@ val requestedTaskNames = gradle.startParameter.taskNames.map { it.substringAfter
 val buildsReleaseApks = requestedTaskNames.any {
     it.startsWith("assemble", ignoreCase = true) && it.endsWith("Release", ignoreCase = true)
 }
+// Optional single-ABI build (e.g. -Pnuvio.abiFilter=arm64-v8a) for non-release APKs.
+// Drops the native libraries of other CPU architectures only; no Kotlin/Java code is removed.
+val nonReleaseAbiFilters: List<String> = if (buildsReleaseApks) {
+    emptyList()
+} else {
+    providers.gradleProperty("nuvio.abiFilter").orNull
+        ?.split(',')
+        ?.map(String::trim)
+        ?.filter { it.isNotEmpty() }
+        .orEmpty()
+}
 
 android {
     namespace = "com.nuvio.android"
@@ -73,6 +84,11 @@ android {
         versionCode = releaseAppVersionCode
         versionName = releaseAppVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        if (nonReleaseAbiFilters.isNotEmpty()) {
+            ndk {
+                abiFilters += nonReleaseAbiFilters
+            }
+        }
     }
 
     flavorDimensions += "distribution"
