@@ -96,7 +96,7 @@ internal class CastProxyServer {
         while (!server.isClosed) {
             val client = try {
                 server.accept()
-            } catch (_: IOException) {
+            } catch (e: IOException) {
                 break
             }
             executor.execute { handle(client, server.localPort) }
@@ -141,9 +141,10 @@ internal class CastProxyServer {
                 }
                 val hostHeader = headers["host"] ?: "127.0.0.1:$port"
                 serve(out, method, source, headers["range"], hostHeader)
-            } catch (_: IOException) {
+            } catch (e: IOException) {
                 // Renderer closed the connection (seek, stop, buffering done): nothing to do.
-            } catch (_: RuntimeException) {
+            } catch (e: RuntimeException) {
+                // Malformed request or upstream URL: drop the connection.
             }
         }
     }
@@ -164,34 +165,34 @@ internal class CastProxyServer {
 
     private fun serve(out: OutputStream, method: String, source: Source, range: String?, hostHeader: String) {
         var currentUrl = source.url
-        var connection: HttpURLConnection? = null
+        var opened: HttpURLConnection? = null
         var redirects = 0
-        while (connection == null) {
-            val c = URL(currentUrl).openConnection() as HttpURLConnection
-            c.instanceFollowRedirects = false
-            c.connectTimeout = 10_000
-            c.readTimeout = 30_000
-            c.requestMethod = "GET"
-            source.headers.forEach { (name, value) -> c.setRequestProperty(name, value) }
-            if (range != null) c.setRequestProperty("Range", range)
-            if (c.getRequestProperty("User-Agent") == null) {
-                c.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) NuvioCast")
+        while (opened == null) {
+            val attempt = URL(currentUrl).openConnection() as HttpURLConnection
+            attempt.instanceFollowRedirects = false
+            attempt.connectTimeout = 10_000
+            attempt.readTimeout = 30_000
+            attempt.requestMethod = "GET"
+            source.headers.forEach { (name, value) -> attempt.setRequestProperty(name, value) }
+            if (range != null) attempt.setRequestProperty("Range", range)
+            if (attempt.getRequestProperty("User-Agent") == null) {
+                attempt.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) NuvioCast")
             }
-            val code = c.responseCode
-            val location = c.getHeaderField("Location")
+            val code = attempt.responseCode
+            val location = attempt.getHeaderField("Location")
             if (code in 300..399 && location != null && redirects < 6) {
                 currentUrl = URL(URL(currentUrl), location).toString()
-                c.disconnect()
+                attempt.disconnect()
                 redirects++
             } else {
-                connection = c
+                opened = attempt
             }
         }
-        val c = connection
+        val c: HttpURLConnection = opened
         try {
             val code = c.responseCode
             val body = if (code in 200..299) c.inputStream else c.errorStream
-            val upstreamType = c.contentType?.substringBefore(';')?.trim()?.lowercase()
+            val upstreamType: String? = c.contentType?.substringBefore(';')?.trim()?.lowercase()
             val isPlaylist = code in 200..299 && (
                 upstreamType?.contains("mpegurl") == true ||
                     currentUrl.substringBefore('?').lowercase().endsWith(".m3u8")
@@ -210,7 +211,7 @@ internal class CastProxyServer {
 
             val generic = upstreamType == null || upstreamType == "application/octet-stream" ||
                 upstreamType == "binary/octet-stream" || upstreamType.startsWith("text/")
-            val type = if (generic) source.mime else upstreamType
+            val type: String = if (generic || upstreamType == null) source.mime else upstreamType
             val length = c.getHeaderField("Content-Length")?.toLongOrNull()
             val contentRange = c.getHeaderField("Content-Range")
 
