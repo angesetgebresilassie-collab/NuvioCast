@@ -49,6 +49,17 @@ val requestedTaskNames = gradle.startParameter.taskNames.map { it.substringAfter
 val buildsReleaseApks = requestedTaskNames.any {
     it.startsWith("assemble", ignoreCase = true) && it.endsWith("Release", ignoreCase = true)
 }
+// Debug-signed, R8-shrunk build used by CI for installable test APKs (no release keystore needed).
+val buildsBenchmarkApks = requestedTaskNames.any {
+    it.startsWith("assemble", ignoreCase = true) && it.endsWith("Benchmark", ignoreCase = true)
+}
+// ABIs to package when splitting, e.g. -Pnuvio.abis=arm64-v8a for a single-ABI APK.
+val splitAbis = providers.gradleProperty("nuvio.abis").orNull
+    ?.split(",")
+    ?.map(String::trim)
+    ?.filter { it.isNotEmpty() }
+    ?.takeIf { it.isNotEmpty() }
+    ?: listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
 
 android {
     namespace = "com.nuvio.android"
@@ -115,9 +126,9 @@ android {
 
     splits {
         abi {
-            isEnable = buildsReleaseApks
+            isEnable = buildsReleaseApks || buildsBenchmarkApks
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            include(*splitAbis.toTypedArray())
             isUniversalApk = false
         }
     }
