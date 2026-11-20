@@ -18,19 +18,16 @@ internal class ProbedAudio(
     val tracks: List<CastAudioTrack>,
     /** CastAudioTrack.id -> absolute stream index in the container. */
     val streamIndexById: Map<String, Int>,
-    val codecById: Map<String, String>,
     val defaultTrackId: String,
     val durationMs: Long,
 )
 
 /**
  * FFmpeg-backed audio track support for receivers that cannot switch tracks themselves.
- * Video is stream-copied; the chosen audio track is copied (or turned into AAC when MPEG-TS
- * cannot carry it) and the result is streamed to the receiver as MPEG-TS through a FIFO.
+ * Video and the chosen audio track are stream-copied (no re-encode) into a live Matroska
+ * stream, which holds any audio codec, and sent to the receiver through a FIFO.
  */
 internal object AudioRemux {
-    // Codecs MPEG-TS carries and receivers decode. Anything else is re-encoded to AAC.
-    private val COPYABLE = setOf("aac", "ac3", "eac3", "mp3", "mp2")
 
     /** [url] must be readable by FFmpeg without TLS or custom headers (use the local server). */
     suspend fun probe(url: String): ProbedAudio? = withContext(Dispatchers.IO) {
@@ -41,7 +38,6 @@ internal object AudioRemux {
 
             val tracks = ArrayList<CastAudioTrack>()
             val indexById = LinkedHashMap<String, Int>()
-            val codecById = HashMap<String, String>()
             var defaultId: String? = null
 
             audio.forEachIndexed { n, s ->
@@ -75,7 +71,6 @@ internal object AudioRemux {
                     channels = channels,
                 )
                 indexById[id] = index
-                codecById[id] = codec
                 val isDefault = runCatching {
                     s.allProperties?.optJSONObject("disposition")?.optInt("default") == 1
                 }.getOrDefault(false)
@@ -86,7 +81,6 @@ internal object AudioRemux {
             ProbedAudio(
                 tracks = tracks,
                 streamIndexById = indexById,
-                codecById = codecById,
                 defaultTrackId = defaultId ?: tracks.first().id,
                 durationMs = durationMs,
             )
@@ -96,25 +90,23 @@ internal object AudioRemux {
     }
 
     /**
-     * Blocks, writing MPEG-TS to [out] until the stream ends or the receiver disconnects.
+     * Blocks, writing live Matroska to [out] until the stream ends or the receiver disconnects.
      * [sourceUrl] must be a plain http URL FFmpeg can seek in (the phone's local server).
      */
     fun stream(
         context: Context,
         sourceUrl: String,
         audioIndex: Int,
-        audioCodec: String,
         startMs: Long,
         out: OutputStream,
     ) {
         val pipe = FFmpegKitConfig.registerNewFFmpegPipe(context)
             ?: throw IOException("Could not create FFmpeg pipe")
-        val audioArgs = if (audioCodec in COPYABLE) "-c:a copy" else "-c:a aac -b:a 384k"
         val seekArgs = if (startMs > 0) "-ss %.3f ".format(Locale.US, startMs / 1000.0) else ""
         val command = "-hide_banner -loglevel error -nostdin -fflags +genpts " +
             seekArgs +
-            "-i $sourceUrl -map 0:v:0? -map 0:$audioIndex -c:v copy $audioArgs " +
-            "-sn -dn -f mpegts -muxdelay 0 -muxpreload 0 -flush_packets 1 -y $pipe"
+            "-i $sourceUrl -map 0:v:0? -map 0:$audioIndex -c copy -sn -dn " +
+            "-f matroska -live 1 -flush_packets 1 -y $pipe"
 
         val session = FFmpegKit.executeAsync(command) { finished ->
             val code = finished.returnCode
