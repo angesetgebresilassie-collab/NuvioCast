@@ -115,12 +115,17 @@ android {
         }
         jniLibs {
             useLegacyPackaging = true
+            // mpv, libass and FFmpegKit (cast audio tracks) all ship FFmpeg shared libraries.
             pickFirsts += listOf(
                 "lib/*/libc++_shared.so",
                 "lib/*/libavcodec.so",
                 "lib/*/libavutil.so",
                 "lib/*/libswscale.so",
-                "lib/*/libswresample.so"
+                "lib/*/libswresample.so",
+                "lib/*/libavformat.so",
+                "lib/*/libavfilter.so",
+                "lib/*/libavdevice.so",
+                "lib/*/libpostproc.so"
             )
         }
     }
