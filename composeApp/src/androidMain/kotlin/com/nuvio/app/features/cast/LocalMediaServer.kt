@@ -26,6 +26,7 @@ import java.util.concurrent.Executors
  * - /u/{token}   range-capable proxy for streams needing headers, plus content:// and file:// media
  * - /hls/{token} HLS playlist rewriting (audio rendition selection, header-protected segments)
  * - /sub/{token} subtitles, optionally converted from SRT to WebVTT (Chromecast needs VTT + CORS)
+ * - /ts/{token}  FFmpeg remux of one chosen audio track (+ video) to a live MPEG-TS stream
  */
 internal class LocalMediaServer(
     private val context: Context,
@@ -34,6 +35,14 @@ internal class LocalMediaServer(
     private class Entry(val url: String, val headers: Map<String, String>, val mime: String?)
     private class SubEntry(val url: String, val headers: Map<String, String>, val toVtt: Boolean)
     private class HlsEntry(val url: String, val headers: Map<String, String>, val audioId: String?)
+    private class TsEntry(
+        val url: String,
+        val headers: Map<String, String>,
+        val mime: String?,
+        val audioIndex: Int,
+        val audioCodec: String,
+        val startMs: Long,
+    )
     private class Req(
         val method: String,
         val path: String,
@@ -43,6 +52,7 @@ internal class LocalMediaServer(
     private val entries = ConcurrentHashMap<String, Entry>()
     private val subs = ConcurrentHashMap<String, SubEntry>()
     private val hlsEntries = ConcurrentHashMap<String, HlsEntry>()
+    private val tsEntries = ConcurrentHashMap<String, TsEntry>()
     private val pool = Executors.newCachedThreadPool { r -> Thread(r, "cast-http").apply { isDaemon = true } }
 
     @Volatile
@@ -74,6 +84,7 @@ internal class LocalMediaServer(
         entries.clear()
         subs.clear()
         hlsEntries.clear()
+        tsEntries.clear()
     }
 
     // ---- registration -------------------------------------------------------------------------
@@ -86,6 +97,23 @@ internal class LocalMediaServer(
 
     fun registerSubtitle(url: String, headers: Map<String, String>, toVtt: Boolean): String =
         token("sub", url, headers, toVtt.toString()).also { subs[it] = SubEntry(url, headers, toVtt) }
+
+    /** A live MPEG-TS stream of [url] carrying only audio stream [audioIndex], starting at [startMs]. */
+    fun registerRemux(
+        url: String,
+        headers: Map<String, String>,
+        mime: String?,
+        audioIndex: Int,
+        audioCodec: String,
+        startMs: Long,
+    ): String =
+        token("ts", url, headers, "$audioIndex|$audioCodec|$startMs").also {
+            tsEntries[it] = TsEntry(url, headers, mime, audioIndex, audioCodec, startMs)
+        }
+
+    /** Plain loopback URL FFmpeg can read (no TLS, headers and content:// handled by this server). */
+    fun loopbackUrlFor(url: String, headers: Map<String, String>, mime: String?): String =
+        "http://127.0.0.1:$port/u/${registerMedia(url, headers, mime)}"
 
     fun urlFor(address: String, kind: String, token: String): String = "http://$address:$port/$kind/$token"
 
@@ -150,6 +178,7 @@ internal class LocalMediaServer(
             "u" -> entries[token]?.let { serveEntry(req, it, out) } ?: notFound(out)
             "hls" -> hlsEntries[token]?.let { serveHls(req, it, out) } ?: notFound(out)
             "sub" -> subs[token]?.let { serveSubtitle(req, it, out) } ?: notFound(out)
+            "ts" -> tsEntries[token]?.let { serveRemux(req, it, out) } ?: notFound(out)
             else -> notFound(out)
         }
     }
@@ -274,6 +303,25 @@ internal class LocalMediaServer(
                 remaining -= n
             }
         }
+    }
+
+    // ---- /ts : FFmpeg audio-track remux ---------------------------------------------------------------
+
+    private fun serveRemux(req: Req, entry: TsEntry, out: OutputStream) {
+        // Live stream: no length, no byte ranges. The session restarts it at a new offset to seek.
+        writeHead(
+            out, 200, "OK",
+            mapOf(
+                "Content-Type" to "video/mp2t",
+                "transferMode.dlna.org" to "Streaming",
+                "contentFeatures.dlna.org" to "DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000",
+                "Cache-Control" to "no-cache",
+            ),
+        )
+        if (req.method == "HEAD") return
+        out.flush()
+        val source = loopbackUrlFor(entry.url, entry.headers, entry.mime)
+        AudioRemux.stream(context, source, entry.audioIndex, entry.audioCodec, entry.startMs, out)
     }
 
     // ---- /hls : playlist rewriting ----------------------------------------------------------------
