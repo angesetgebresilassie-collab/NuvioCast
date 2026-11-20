@@ -57,6 +57,11 @@
 -keep class is.xyz.mpv.** { *; }
 -keep interface is.xyz.mpv.** { *; }
 
+# FFmpegKit (cast audio track remux) is called from JNI.
+-keep class com.arthenica.ffmpegkit.** { *; }
+-keep class com.arthenica.smartexception.** { *; }
+-dontwarn com.arthenica.**
+
 # Common optional security providers used by okhttp on some devices.
 -dontwarn okhttp3.internal.platform.**
 -dontwarn org.conscrypt.**
