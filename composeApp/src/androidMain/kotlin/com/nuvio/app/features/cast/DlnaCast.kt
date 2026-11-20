@@ -202,7 +202,7 @@ internal class DlnaSession(
     /** Audio streams FFmpeg found in a plain file with more than one; null when not applicable. */
     private var probed: ProbedAudio? = null
 
-    /** True while the receiver is playing the FFmpeg MPEG-TS stream (no native seeking). */
+    /** True while the receiver is playing the FFmpeg Matroska stream (no native seeking). */
     private var remuxing = false
 
     /** Position in the file where the current remux stream started; added to the receiver's clock. */
@@ -255,12 +255,12 @@ internal class DlnaSession(
     }
 
     private suspend fun probeFile(media: CastMedia, mime: String): ProbedAudio? {
-        val address = LocalMediaServer.localAddressFor(device.host) ?: return null
+        if (LocalMediaServer.localAddressFor(device.host) == null) return null
         return runCatching {
             server.start()
             // FFmpeg has no TLS and no custom headers, so it reads through the local server.
             AudioRemux.probe(server.loopbackUrlFor(media.url, media.headers, media.mimeType ?: mime))
-        }.getOrNull().also { if (it == null) address.length }
+        }.getOrNull()
     }
 
     private suspend fun startPlayback(media: CastMedia, mime: String, audioId: String?, startAtMs: Long) {
@@ -309,10 +309,9 @@ internal class DlnaSession(
                     headers = media.headers,
                     mime = media.mimeType,
                     audioIndex = index,
-                    audioCodec = p.codecById[audioId].orEmpty(),
                     startMs = startAtMs,
                 )
-                return Prepared(server.urlFor(address, "ts", token), "video/mp2t", remux = true)
+                return Prepared(server.remuxUrlFor(address, token), "video/x-matroska", remux = true)
             }
         }
 
@@ -464,7 +463,7 @@ internal class DlnaSession(
                         it.copy(
                             status = status,
                             positionMs = if (pendingSeekMs > 0) it.positionMs else rel + offset,
-                            // A live MPEG-TS stream has no meaningful duration of its own.
+                            // A live stream has no meaningful duration of its own.
                             durationMs = if (!remuxing && dur > 0) dur else it.durationMs,
                         )
                     }
