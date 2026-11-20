@@ -183,6 +183,8 @@ internal class DlnaSession(
     private val server: LocalMediaServer,
 ) : CastSession {
 
+    private class Prepared(val url: String, val mime: String, val remux: Boolean)
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _state = MutableStateFlow(CastSessionState(device = device, status = CastPlayerStatus.CONNECTING))
     override val state: StateFlow<CastSessionState> = _state.asStateFlow()
@@ -197,13 +199,26 @@ internal class DlnaSession(
     private var pendingSeekMs = 0L
     private var loadingUntil = 0L
 
+    /** Audio streams FFmpeg found in a plain file with more than one; null when not applicable. */
+    private var probed: ProbedAudio? = null
+
+    /** True while the receiver is playing the FFmpeg MPEG-TS stream (no native seeking). */
+    private var remuxing = false
+
+    /** Position in the file where the current remux stream started; added to the receiver's clock. */
+    private var streamOffsetMs = 0L
+
     override suspend fun load(media: CastMedia) {
         this.media = media
         val mime = guessMimeType(media.url, media.mimeType)
+        val hls = isHlsUrl(media.url, mime)
+        probed = null
+        remuxing = false
+        streamOffsetMs = 0L
 
         var tracks = media.audioTracks
         var selected = media.selectedAudioTrackId
-        if (isHlsUrl(media.url, mime)) {
+        if (hls) {
             val fromMaster = fetchHlsAudioTracks(media)
             if (fromMaster.size > 1) {
                 tracks = fromMaster
@@ -211,9 +226,17 @@ internal class DlnaSession(
                     ?: fromMaster.firstOrNull { it.language != null && it.id == media.selectedAudioTrackId }?.id
                     ?: fromMaster.first().id
             }
+        } else if (media.audioTracks.none { it.sourceUrl != null }) {
+            // Plain file (MKV/MP4/AVI/TS...): let FFmpeg list the audio tracks so they can be switched.
+            probeFile(media, mime)?.takeIf { it.tracks.size > 1 }?.let { p ->
+                probed = p
+                tracks = p.tracks
+                selected = selected?.takeIf { id -> p.tracks.any { it.id == id } } ?: p.defaultTrackId
+            }
         }
         val mode = when {
-            isHlsUrl(media.url, mime) && tracks.size > 1 -> AudioSwitchMode.RELOAD
+            hls && tracks.size > 1 -> AudioSwitchMode.RELOAD
+            probed != null -> AudioSwitchMode.RELOAD
             tracks.size > 1 && tracks.any { it.sourceUrl != null } -> AudioSwitchMode.RELOAD
             else -> AudioSwitchMode.NONE
         }
@@ -223,7 +246,7 @@ internal class DlnaSession(
                 audioTracks = tracks,
                 selectedAudioTrackId = selected,
                 audioSwitchMode = mode,
-                durationMs = media.durationMs,
+                durationMs = media.durationMs.takeIf { d -> d > 0 } ?: probed?.durationMs ?: 0L,
                 error = null,
             )
         }
@@ -231,10 +254,21 @@ internal class DlnaSession(
         refreshVolume()
     }
 
+    private suspend fun probeFile(media: CastMedia, mime: String): ProbedAudio? {
+        val address = LocalMediaServer.localAddressFor(device.host) ?: return null
+        return runCatching {
+            server.start()
+            // FFmpeg has no TLS and no custom headers, so it reads through the local server.
+            AudioRemux.probe(server.loopbackUrlFor(media.url, media.headers, media.mimeType ?: mime))
+        }.getOrNull().also { if (it == null) address.length }
+    }
+
     private suspend fun startPlayback(media: CastMedia, mime: String, audioId: String?, startAtMs: Long) {
         _state.update { it.copy(status = CastPlayerStatus.LOADING, positionMs = startAtMs, error = null) }
         try {
-            val prepared = prepare(media, mime, audioId)
+            val prepared = prepare(media, mime, audioId, startAtMs)
+            remuxing = prepared.remux
+            streamOffsetMs = if (prepared.remux) startAtMs else 0L
             val subtitleUrl = media.subtitle?.let { sub ->
                 val address = LocalMediaServer.localAddressFor(device.host)
                 if (address != null && (sub.url.startsWith("content") || sub.url.startsWith("file"))) {
@@ -246,11 +280,12 @@ internal class DlnaSession(
             runCatching { soapAvt("Stop") }
             soapAvt(
                 "SetAVTransportURI",
-                "CurrentURI" to prepared.first,
-                "CurrentURIMetaData" to didl(media, prepared.first, prepared.second, subtitleUrl),
+                "CurrentURI" to prepared.url,
+                "CurrentURIMetaData" to didl(media, prepared.url, prepared.mime, subtitleUrl, prepared.remux),
             )
             soapAvt("Play", "Speed" to "1")
-            pendingSeekMs = startAtMs
+            // A remux stream already starts at startAtMs, so there is nothing to seek to afterwards.
+            pendingSeekMs = if (prepared.remux) 0L else startAtMs
             loadingUntil = System.currentTimeMillis() + 10_000
             startPolling()
         } catch (e: Exception) {
@@ -259,23 +294,49 @@ internal class DlnaSession(
         }
     }
 
-    /** Returns the URL the receiver should fetch and its mime type. */
-    private fun prepare(media: CastMedia, mime: String, audioId: String?): Pair<String, String> {
+    /** Returns what the receiver should fetch: URL, mime type, and whether it is the FFmpeg stream. */
+    private fun prepare(media: CastMedia, mime: String, audioId: String?, startAtMs: Long): Prepared {
         val address = LocalMediaServer.localAddressFor(device.host)
+
+        val p = probed
+        if (p != null && audioId != null) {
+            val index = p.streamIndexById[audioId]
+            if (index != null) {
+                requireNotNull(address) { "Could not find this phone's Wi-Fi address" }
+                server.start()
+                val token = server.registerRemux(
+                    url = media.url,
+                    headers = media.headers,
+                    mime = media.mimeType,
+                    audioIndex = index,
+                    audioCodec = p.codecById[audioId].orEmpty(),
+                    startMs = startAtMs,
+                )
+                return Prepared(server.urlFor(address, "ts", token), "video/mp2t", remux = true)
+            }
+        }
+
         val source = media.audioTracks.firstOrNull { it.id == audioId }?.sourceUrl ?: media.url
         val scheme = source.substringBefore(':').lowercase()
         val isLocal = scheme == "content" || scheme == "file"
         val needsServer = isLocal || media.headers.isNotEmpty() || media.forceProxy ||
             (isHlsUrl(source, mime) && audioId != null && _state.value.audioSwitchMode == AudioSwitchMode.RELOAD)
-        if (!needsServer) return source to mime
+        if (!needsServer) return Prepared(source, mime, remux = false)
 
         requireNotNull(address) { "Could not find this phone's Wi-Fi address" }
         server.start()
         return if (isHlsUrl(source, mime)) {
-            server.urlFor(address, "hls", server.registerHls(source, media.headers, audioId)) to
-                "application/vnd.apple.mpegurl"
+            Prepared(
+                server.urlFor(address, "hls", server.registerHls(source, media.headers, audioId)),
+                "application/vnd.apple.mpegurl",
+                remux = false,
+            )
         } else {
-            server.urlFor(address, "u", server.registerMedia(source, media.headers, media.mimeType)) to mime
+            Prepared(
+                server.urlFor(address, "u", server.registerMedia(source, media.headers, media.mimeType)),
+                mime,
+                remux = false,
+            )
         }
     }
 
@@ -313,6 +374,13 @@ internal class DlnaSession(
     }
 
     override suspend fun seekTo(positionMs: Long) {
+        if (remuxing) {
+            // The FFmpeg stream cannot be sought: restart it at the new offset, same audio track.
+            val current = media ?: return
+            val track = _state.value.selectedAudioTrackId
+            startPlayback(current, guessMimeType(current.url, current.mimeType), track, positionMs)
+            return
+        }
         soapAvt("Seek", "Unit" to "REL_TIME", "Target" to formatTime(positionMs))
         _state.update { it.copy(positionMs = positionMs) }
     }
@@ -391,11 +459,13 @@ internal class DlnaSession(
                     } else if (status == CastPlayerStatus.PLAYING) {
                         pendingSeekMs = 0
                     }
+                    val offset = if (remuxing) streamOffsetMs else 0L
                     _state.update {
                         it.copy(
                             status = status,
-                            positionMs = if (pendingSeekMs > 0) it.positionMs else rel,
-                            durationMs = if (dur > 0) dur else it.durationMs,
+                            positionMs = if (pendingSeekMs > 0) it.positionMs else rel + offset,
+                            // A live MPEG-TS stream has no meaningful duration of its own.
+                            durationMs = if (!remuxing && dur > 0) dur else it.durationMs,
                         )
                     }
                 } catch (_: Exception) {
@@ -464,9 +534,14 @@ internal class DlnaSession(
         return m.groupValues[1].trim()
     }
 
-    private fun didl(media: CastMedia, url: String, mime: String, subtitleUrl: String?): String {
+    private fun didl(media: CastMedia, url: String, mime: String, subtitleUrl: String?, remux: Boolean): String {
         val isHls = isHlsUrl(url, mime)
-        val flags = if (isHls) "*" else "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        val flags = when {
+            isHls -> "*"
+            // Live converted stream: not seekable by byte or time.
+            remux -> "DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+            else -> "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+        }
         val kind = if (mime.startsWith("audio/")) "object.item.audioItem.musicTrack" else "object.item.videoItem"
         return buildString {
             append("""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" """)
