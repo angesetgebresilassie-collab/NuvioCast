@@ -26,7 +26,7 @@ import java.util.concurrent.Executors
  * - /u/{token}   range-capable proxy for streams needing headers, plus content:// and file:// media
  * - /hls/{token} HLS playlist rewriting (audio rendition selection, header-protected segments)
  * - /sub/{token} subtitles, optionally converted from SRT to WebVTT (Chromecast needs VTT + CORS)
- * - /mkv/{token}.mkv  FFmpeg remux of one chosen audio track (+ video) to a live Matroska stream
+ * - /mkv/{token}.mkv  FFmpeg remux of one chosen audio track (+ video) to a Matroska stream with duration
  */
 internal class LocalMediaServer(
     private val context: Context,
@@ -41,6 +41,7 @@ internal class LocalMediaServer(
         val mime: String?,
         val audioIndex: Int,
         val startMs: Long,
+        val durationMs: Long,
     )
     private class Req(
         val method: String,
@@ -97,16 +98,20 @@ internal class LocalMediaServer(
     fun registerSubtitle(url: String, headers: Map<String, String>, toVtt: Boolean): String =
         token("sub", url, headers, toVtt.toString()).also { subs[it] = SubEntry(url, headers, toVtt) }
 
-    /** A live Matroska stream of [url] carrying only audio stream [audioIndex], starting at [startMs]. */
+    /**
+     * A Matroska stream of [url] carrying only audio stream [audioIndex], starting at [startMs].
+     * [durationMs] is this stream's length (original duration minus [startMs]), 0 if unknown.
+     */
     fun registerRemux(
         url: String,
         headers: Map<String, String>,
         mime: String?,
         audioIndex: Int,
         startMs: Long,
+        durationMs: Long,
     ): String =
-        token("mkv", url, headers, "$audioIndex|$startMs").also {
-            remuxEntries[it] = RemuxEntry(url, headers, mime, audioIndex, startMs)
+        token("mkv", url, headers, "$audioIndex|$startMs|$durationMs").also {
+            remuxEntries[it] = RemuxEntry(url, headers, mime, audioIndex, startMs, durationMs)
         }
 
     /** Plain loopback URL FFmpeg can read (no TLS, headers and content:// handled by this server). */
@@ -309,7 +314,8 @@ internal class LocalMediaServer(
     // ---- /mkv : FFmpeg audio-track remux ---------------------------------------------------------------
 
     private fun serveRemux(req: Req, entry: RemuxEntry, out: OutputStream) {
-        // Live stream: no length, no byte ranges. The session restarts it at a new offset to seek.
+        // Streamed as it is produced: no Content-Length, no byte ranges. The session restarts it
+        // at a new offset to seek. The original duration is written into the Matroska header.
         writeHead(
             out, 200, "OK",
             mapOf(
@@ -322,7 +328,7 @@ internal class LocalMediaServer(
         if (req.method == "HEAD") return
         out.flush()
         val source = loopbackUrlFor(entry.url, entry.headers, entry.mime)
-        AudioRemux.stream(context, source, entry.audioIndex, entry.startMs, out)
+        AudioRemux.stream(context, source, entry.audioIndex, entry.startMs, entry.durationMs, out)
     }
 
     // ---- /hls : playlist rewriting ----------------------------------------------------------------
