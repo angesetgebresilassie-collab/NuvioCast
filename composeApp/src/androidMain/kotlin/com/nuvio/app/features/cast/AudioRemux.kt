@@ -24,10 +24,16 @@ internal class ProbedAudio(
 
 /**
  * FFmpeg-backed audio track support for receivers that cannot switch tracks themselves.
- * Video and the chosen audio track are stream-copied (no re-encode) into a live Matroska
- * stream, which holds any audio codec, and sent to the receiver through a FIFO.
+ * Video and the chosen audio track are stream-copied (no re-encode) into a Matroska stream
+ * that carries the original file's duration, and sent to the receiver through a FIFO.
  */
 internal object AudioRemux {
+
+    // FFmpeg's Matroska muxer reserves an 11-byte EBML Void in the Segment Info for the Duration and
+    // only fills it in when it can seek back, which a pipe cannot. We fill it in ourselves.
+    private val INFO_ID = byteArrayOf(0x15, 0x49, 0xA9.toByte(), 0x66)
+    private val DURATION_VOID = byteArrayOf(0xEC.toByte(), 1, 0, 0, 0, 0, 0, 0, 2, 0, 0)
+    private const val HEADER_WINDOW = 32 * 1024
 
     /** [url] must be readable by FFmpeg without TLS or custom headers (use the local server). */
     suspend fun probe(url: String): ProbedAudio? = withContext(Dispatchers.IO) {
@@ -90,14 +96,16 @@ internal object AudioRemux {
     }
 
     /**
-     * Blocks, writing live Matroska to [out] until the stream ends or the receiver disconnects.
+     * Blocks, writing Matroska to [out] until the stream ends or the receiver disconnects.
      * [sourceUrl] must be a plain http URL FFmpeg can seek in (the phone's local server).
+     * [durationMs] is the length of this stream (the original duration minus [startMs]); 0 = unknown.
      */
     fun stream(
         context: Context,
         sourceUrl: String,
         audioIndex: Int,
         startMs: Long,
+        durationMs: Long,
         out: OutputStream,
     ) {
         val pipe = FFmpegKitConfig.registerNewFFmpegPipe(context)
@@ -106,7 +114,7 @@ internal object AudioRemux {
         val command = "-hide_banner -loglevel error -nostdin -fflags +genpts " +
             seekArgs +
             "-i $sourceUrl -map 0:v:0? -map 0:$audioIndex -c copy -sn -dn " +
-            "-f matroska -live 1 -flush_packets 1 -y $pipe"
+            "-f matroska -flush_packets 1 -y $pipe"
 
         val session = FFmpegKit.executeAsync(command) { finished ->
             val code = finished.returnCode
@@ -119,10 +127,57 @@ internal object AudioRemux {
             }
         }
         try {
-            FileInputStream(pipe).use { it.copyTo(out, 64 * 1024) }
+            FileInputStream(pipe).use { input ->
+                val head = ByteArray(HEADER_WINDOW)
+                var filled = 0
+                if (durationMs > 0) {
+                    // Hold back just the header until the Duration slot is found and filled in.
+                    while (filled < head.size) {
+                        val n = input.read(head, filled, head.size - filled)
+                        if (n < 0) break
+                        filled += n
+                        if (patchDuration(head, filled, durationMs)) break
+                    }
+                } else {
+                    val n = input.read(head)
+                    if (n > 0) filled = n
+                }
+                if (filled > 0) out.write(head, 0, filled)
+                input.copyTo(out, 64 * 1024)
+            }
         } finally {
             runCatching { FFmpegKit.cancel(session.sessionId) }
             runCatching { FFmpegKitConfig.closeFFmpegPipe(pipe) }
         }
+    }
+
+    /** Overwrites the reserved Void in the Segment Info with a Duration element (float64, in ms). */
+    private fun patchDuration(buf: ByteArray, len: Int, durationMs: Long): Boolean {
+        val info = indexOf(buf, len, INFO_ID, 0)
+        if (info < 0) return false
+        val slot = indexOf(buf, len, DURATION_VOID, info)
+        if (slot < 0) return false
+        val bits = java.lang.Double.doubleToRawLongBits(durationMs.toDouble())
+        buf[slot] = 0x44
+        buf[slot + 1] = 0x89.toByte()
+        buf[slot + 2] = 0x88.toByte()
+        for (i in 0 until 8) buf[slot + 3 + i] = (bits ushr (56 - 8 * i)).toByte()
+        return true
+    }
+
+    private fun indexOf(buf: ByteArray, len: Int, pattern: ByteArray, from: Int): Int {
+        var i = from
+        while (i <= len - pattern.size) {
+            var match = true
+            for (j in pattern.indices) {
+                if (buf[i + j] != pattern[j]) {
+                    match = false
+                    break
+                }
+            }
+            if (match) return i
+            i++
+        }
+        return -1
     }
 }
