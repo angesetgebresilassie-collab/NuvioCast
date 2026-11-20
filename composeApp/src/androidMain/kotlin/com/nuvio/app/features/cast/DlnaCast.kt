@@ -183,7 +183,8 @@ internal class DlnaSession(
     private val server: LocalMediaServer,
 ) : CastSession {
 
-    private class Prepared(val url: String, val mime: String, val remux: Boolean)
+    /** [durationMs] is the stream's own length, set only for the FFmpeg stream (0 = let the receiver decide). */
+    private class Prepared(val url: String, val mime: String, val remux: Boolean, val durationMs: Long = 0L)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _state = MutableStateFlow(CastSessionState(device = device, status = CastPlayerStatus.CONNECTING))
@@ -281,7 +282,7 @@ internal class DlnaSession(
             soapAvt(
                 "SetAVTransportURI",
                 "CurrentURI" to prepared.url,
-                "CurrentURIMetaData" to didl(media, prepared.url, prepared.mime, subtitleUrl, prepared.remux),
+                "CurrentURIMetaData" to didl(media, prepared.url, prepared.mime, subtitleUrl, prepared.remux, prepared.durationMs),
             )
             soapAvt("Play", "Speed" to "1")
             // A remux stream already starts at startAtMs, so there is nothing to seek to afterwards.
@@ -304,14 +305,18 @@ internal class DlnaSession(
             if (index != null) {
                 requireNotNull(address) { "Could not find this phone's Wi-Fi address" }
                 server.start()
+                // The original file's length, minus what was skipped; the receiver's clock starts at 0.
+                val total = p.durationMs.takeIf { it > 0 } ?: media.durationMs
+                val remaining = (total - startAtMs).coerceAtLeast(0L)
                 val token = server.registerRemux(
                     url = media.url,
                     headers = media.headers,
                     mime = media.mimeType,
                     audioIndex = index,
                     startMs = startAtMs,
+                    durationMs = remaining,
                 )
-                return Prepared(server.remuxUrlFor(address, token), "video/x-matroska", remux = true)
+                return Prepared(server.remuxUrlFor(address, token), "video/x-matroska", remux = true, durationMs = remaining)
             }
         }
 
@@ -463,7 +468,8 @@ internal class DlnaSession(
                         it.copy(
                             status = status,
                             positionMs = if (pendingSeekMs > 0) it.positionMs else rel + offset,
-                            // A live stream has no meaningful duration of its own.
+                            // For the FFmpeg stream the receiver only knows the remaining length,
+                            // so keep the original file's duration.
                             durationMs = if (!remuxing && dur > 0) dur else it.durationMs,
                         )
                     }
@@ -533,15 +539,23 @@ internal class DlnaSession(
         return m.groupValues[1].trim()
     }
 
-    private fun didl(media: CastMedia, url: String, mime: String, subtitleUrl: String?, remux: Boolean): String {
+    private fun didl(
+        media: CastMedia,
+        url: String,
+        mime: String,
+        subtitleUrl: String?,
+        remux: Boolean,
+        durationMs: Long,
+    ): String {
         val isHls = isHlsUrl(url, mime)
         val flags = when {
             isHls -> "*"
-            // Live converted stream: not seekable by byte or time.
+            // Streamed as produced: not seekable by byte or time on the receiver's side.
             remux -> "DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"
             else -> "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
         }
         val kind = if (mime.startsWith("audio/")) "object.item.audioItem.musicTrack" else "object.item.videoItem"
+        val durationAttr = if (durationMs > 0) """ duration="${formatDidlDuration(durationMs)}"""" else ""
         return buildString {
             append("""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" """)
             append("""xmlns:dc="http://purl.org/dc/elements/1.1/" """)
@@ -552,7 +566,8 @@ internal class DlnaSession(
             append("<dc:title>").append(escapeXml(media.title)).append("</dc:title>")
             append("<upnp:class>").append(kind).append("</upnp:class>")
             media.posterUrl?.let { append("<upnp:albumArtURI>").append(escapeXml(it)).append("</upnp:albumArtURI>") }
-            append("""<res protocolInfo="http-get:*:""").append(escapeXml(mime)).append(':').append(flags).append("\">")
+            append("""<res protocolInfo="http-get:*:""").append(escapeXml(mime)).append(':').append(flags).append('"')
+            append(durationAttr).append('>')
             append(escapeXml(url)).append("</res>")
             if (subtitleUrl != null) {
                 append("""<res protocolInfo="http-get:*:text/srt:*">""").append(escapeXml(subtitleUrl)).append("</res>")
@@ -572,6 +587,13 @@ internal class DlnaSession(
     private fun formatTime(ms: Long): String {
         val total = (ms / 1000).coerceAtLeast(0)
         return "%d:%02d:%02d".format(total / 3600, (total % 3600) / 60, total % 60)
+    }
+
+    /** DIDL-Lite res@duration: H+:MM:SS.mmm */
+    private fun formatDidlDuration(ms: Long): String {
+        val total = ms.coerceAtLeast(0)
+        val seconds = total / 1000
+        return "%d:%02d:%02d.%03d".format(seconds / 3600, (seconds % 3600) / 60, seconds % 60, total % 1000)
     }
 
     private fun parseTime(value: String?): Long {
