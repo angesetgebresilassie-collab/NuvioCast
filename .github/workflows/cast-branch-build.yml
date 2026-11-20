@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  shrunk-arm64-build:
-    name: Build shrunk arm64 APK
+  full-debug-build:
+    name: Build fullDebug APK
     runs-on: ubuntu-latest
 
     steps:
@@ -41,24 +41,19 @@ jobs:
             touch local.properties
           fi
 
-      - name: Build shrunk arm64 APK (R8 + resource shrinking, debug-signed)
-        run: ./gradlew :androidApp:assembleFullBenchmark -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore -Pnuvio.abis=arm64-v8a --stacktrace
+      - name: Build fullDebug APK
+        run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --stacktrace
 
-      - name: Collect APK and report size
+      - name: Report APK size
         run: |
-          APK=$(ls androidApp/build/outputs/apk/full/benchmark/*arm64-v8a*.apk | head -n 1)
-          cp "$APK" app-arm64-shrunk.apk
-          SIZE=$(du -h app-arm64-shrunk.apk | cut -f1)
-          echo "APK size: $SIZE"
-          echo "### Shrunk arm64 APK: $SIZE" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          unzip -lv app-arm64-shrunk.apk | sort -k3 -n -r | head -n 15 >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          SIZE=$(du -h androidApp/build/outputs/apk/full/debug/androidApp-full-debug.apk | cut -f1)
+          echo "### fullDebug APK: $SIZE (before artifact compression)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload shrunk APK
+      - name: Upload fullDebug APK (max compression)
         uses: actions/upload-artifact@v7
         with:
-          path: app-arm64-shrunk.apk
-          archive: false
+          name: androidApp-full-debug
+          path: androidApp/build/outputs/apk/full/debug/androidApp-full-debug.apk
+          compression-level: 9
           if-no-files-found: error
           retention-days: 7
