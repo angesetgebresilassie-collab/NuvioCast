@@ -468,6 +468,8 @@ kotlin {
                 implementation("androidx.media3:media3-effect:1.8.0")
                 implementation("androidx.annotation:annotation-experimental:1.3.1")
                 implementation(libs.mpv.android.lib)
+                // FFmpeg for the cast engine's audio track selector (probe + MPEG-TS remux).
+                implementation("dev.ffmpegkit-maintained:ffmpeg:7.1.5")
                 implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("lib-*.aar"))))
                 if (androidDistribution == "full") {
                     implementation(files("libs/quickjs-kt-android-1.0.5-nuvio.aar"))
