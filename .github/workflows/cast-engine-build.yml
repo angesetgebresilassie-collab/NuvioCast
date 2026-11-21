@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: "benchmark = minified (R8) + arm64 only, ~release size. debug = unminified, faster to build."
+        description: "debug = the normal build (default). benchmark = minified with R8, smaller but riskier."
         type: choice
-        options: [benchmark, debug]
-        default: benchmark
+        options: [debug, benchmark]
+        default: debug
 
 permissions:
   contents: read
@@ -50,13 +50,14 @@ jobs:
             touch local.properties
           fi
 
-      # gradle.properties asks for a 12 GB Gradle daemon plus an 8 GB Kotlin daemon, which is
-      # more than the 16 GB runner has and makes the build swap. Run Kotlin inside one 7 GB
-      # daemon instead. arm64-v8a only: that is the one ABI phones need, and it drops the
-      # x86/x86_64/armeabi-v7a copies of every native library (mpv, libass, FFmpeg...).
+      # The only size change in the default build is dropping the native libraries of other
+      # CPU architectures (arm64-v8a is what phones use). No code is removed or renamed, so
+      # the app behaves exactly like the plain debug build.
+      # gradle.properties asks for a 12 GB Gradle daemon plus an 8 GB Kotlin daemon, more than
+      # the 16 GB runner has, so Kotlin runs inside one 7 GB daemon instead.
       - name: Build APK
         env:
-          VARIANT: ${{ inputs.variant || 'benchmark' }}
+          VARIANT: ${{ inputs.variant || 'debug' }}
         run: |
           TASK="assembleFull$(echo "${VARIANT:0:1}" | tr a-z A-Z)${VARIANT:1}"
           ./gradlew ":androidApp:${TASK}" \
@@ -69,7 +70,7 @@ jobs:
 
       - name: APK size
         env:
-          VARIANT: ${{ inputs.variant || 'benchmark' }}
+          VARIANT: ${{ inputs.variant || 'debug' }}
         run: |
           APK=$(ls androidApp/build/outputs/apk/full/${VARIANT}/*.apk | head -n1)
           echo "APK=$APK" >> "$GITHUB_ENV"
@@ -79,7 +80,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
-          name: nuviocast-full-${{ inputs.variant || 'benchmark' }}
+          name: nuviocast-full-${{ inputs.variant || 'debug' }}
           path: ${{ env.APK }}
           if-no-files-found: error
           retention-days: 7
