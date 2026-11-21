@@ -4,16 +4,6 @@ on:
   push:
     branches: [cast-engine]
   workflow_dispatch:
-    inputs:
-      arm64_only:
-        description: "Only include arm64 native libraries (much smaller APK). Off = same build as the last known-good one."
-        type: boolean
-        default: false
-      variant:
-        description: "debug = the normal build. benchmark = minified with R8 (smaller, riskier)."
-        type: choice
-        options: [debug, benchmark]
-        default: debug
 
 permissions:
   contents: read
@@ -23,10 +13,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  full-build:
-    name: Build full APK
+  full-debug-build:
+    name: Build fullDebug APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
 
     steps:
       # No submodules: MPVKit is iOS-only and libass-android is an orphan
@@ -39,15 +28,6 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-
-      # Every CI run starts on a fresh machine, and Android generates a brand-new random debug
-      # key on a fresh machine. Each APK was therefore signed differently and could not be
-      # installed over the previous one ("conflicts with an existing package"). Using one fixed
-      # debug key makes every build an in-place update that keeps your data and plugins.
-      - name: Install fixed debug signing key
-        run: |
-          mkdir -p "$HOME/.android"
-          base64 --decode .github/debug.keystore.b64 > "$HOME/.android/debug.keystore"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
@@ -63,38 +43,13 @@ jobs:
             touch local.properties
           fi
 
-      # gradle.properties asks for a 12 GB Gradle daemon plus an 8 GB Kotlin daemon, more than
-      # the 16 GB runner has, so Kotlin runs inside one 7 GB daemon instead (build speed only).
-      - name: Build APK
-        env:
-          VARIANT: ${{ inputs.variant || 'debug' }}
-          ARM64_ONLY: ${{ inputs.arm64_only || 'false' }}
-        run: |
-          TASK="assembleFull$(echo "${VARIANT:0:1}" | tr a-z A-Z)${VARIANT:1}"
-          ABI_ARG=""
-          if [ "$ARM64_ONLY" = "true" ]; then ABI_ARG="-Pnuvio.abiFilter=arm64-v8a"; fi
-          ./gradlew ":androidApp:${TASK}" \
-            -Pnuvio.android.distribution=full \
-            -Pnuvio.ios.distribution=appstore \
-            $ABI_ARG \
-            -Pkotlin.compiler.execution.strategy=in-process \
-            "-Dorg.gradle.jvmargs=-Xmx7g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
-            --parallel --stacktrace
+      - name: Build fullDebug APK
+        run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --stacktrace
 
-      - name: APK size and signing key
-        env:
-          VARIANT: ${{ inputs.variant || 'debug' }}
-        run: |
-          APK=$(ls androidApp/build/outputs/apk/full/${VARIANT}/*.apk | head -n1)
-          echo "APK=$APK" >> "$GITHUB_ENV"
-          ls -lh "$APK"
-          echo "### APK size: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
-          keytool -printcert -jarfile "$APK" | grep "SHA256:" | tee -a "$GITHUB_STEP_SUMMARY" || true
-
-      - name: Upload APK
+      - name: Upload fullDebug APK
         uses: actions/upload-artifact@v7
         with:
-          name: nuviocast-full-${{ inputs.variant || 'debug' }}
-          path: ${{ env.APK }}
+          name: nuviocast-full-debug
+          path: androidApp/build/outputs/apk/full/debug/androidApp-full-debug.apk
           if-no-files-found: error
           retention-days: 7
