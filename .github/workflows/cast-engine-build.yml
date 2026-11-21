@@ -4,6 +4,12 @@ on:
   push:
     branches: [cast-engine]
   workflow_dispatch:
+    inputs:
+      variant:
+        description: "benchmark = minified (R8) + arm64 only, ~release size. debug = unminified, faster to build."
+        type: choice
+        options: [benchmark, debug]
+        default: benchmark
 
 permissions:
   contents: read
@@ -13,9 +19,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  full-debug-build:
-    name: Build fullDebug APK
+  full-build:
+    name: Build full APK (arm64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       # No submodules: MPVKit is iOS-only and libass-android is an orphan
@@ -43,13 +50,36 @@ jobs:
             touch local.properties
           fi
 
-      - name: Build fullDebug APK
-        run: ./gradlew :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --stacktrace
+      # gradle.properties asks for a 12 GB Gradle daemon plus an 8 GB Kotlin daemon, which is
+      # more than the 16 GB runner has and makes the build swap. Run Kotlin inside one 7 GB
+      # daemon instead. arm64-v8a only: that is the one ABI phones need, and it drops the
+      # x86/x86_64/armeabi-v7a copies of every native library (mpv, libass, FFmpeg...).
+      - name: Build APK
+        env:
+          VARIANT: ${{ inputs.variant || 'benchmark' }}
+        run: |
+          TASK="assembleFull$(echo "${VARIANT:0:1}" | tr a-z A-Z)${VARIANT:1}"
+          ./gradlew ":androidApp:${TASK}" \
+            -Pnuvio.android.distribution=full \
+            -Pnuvio.ios.distribution=appstore \
+            -Pnuvio.abiFilter=arm64-v8a \
+            -Pkotlin.compiler.execution.strategy=in-process \
+            "-Dorg.gradle.jvmargs=-Xmx7g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
+            --parallel --stacktrace
 
-      - name: Upload fullDebug APK
+      - name: APK size
+        env:
+          VARIANT: ${{ inputs.variant || 'benchmark' }}
+        run: |
+          APK=$(ls androidApp/build/outputs/apk/full/${VARIANT}/*.apk | head -n1)
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          ls -lh "$APK"
+          echo "### APK size: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
-          name: nuviocast-full-debug
-          path: androidApp/build/outputs/apk/full/debug/androidApp-full-debug.apk
+          name: nuviocast-full-${{ inputs.variant || 'benchmark' }}
+          path: ${{ env.APK }}
           if-no-files-found: error
           retention-days: 7
