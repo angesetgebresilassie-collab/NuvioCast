@@ -41,7 +41,6 @@ object CastManager {
 
     private var server: LocalMediaServer? = null
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var dlnaDiscovery: DlnaDiscovery? = null
     private var chromecastDiscovery: ChromecastDiscovery? = null
     private var scanJob: Job? = null
 
@@ -72,6 +71,7 @@ object CastManager {
         val ctx = appContext ?: return
         if (scanJob?.isActive == true) return
 
+        // Without this lock many phones drop incoming multicast/SSDP traffic to save battery.
         runCatching {
             val wifi = ctx.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             multicastLock = wifi?.createMulticastLock("nuviocast-discovery")?.apply {
@@ -86,7 +86,7 @@ object CastManager {
             publish()
         }
 
-        val dlna = DlnaDiscovery(http).also { dlnaDiscovery = it }
+        val dlna = SsdpDiscovery(ctx, http)
         _scanning.value = true
         scanJob = scope.launch {
             try {
@@ -97,7 +97,7 @@ object CastManager {
                             publish()
                         }
                     }
-                    delay(2_000)
+                    delay(1_500)
                 }
             } finally {
                 _scanning.value = false
