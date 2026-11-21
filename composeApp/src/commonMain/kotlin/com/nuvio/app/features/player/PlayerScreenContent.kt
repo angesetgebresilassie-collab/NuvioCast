@@ -3,17 +3,27 @@ package com.nuvio.app.features.player
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeContent
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -196,5 +206,51 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
             partyPanelInset = partyPanelInset,
             dockPartyPanel = dockPartyPanel,
         )
+
+        // Cast button (Android draws it, other platforms draw nothing). Top right, just below the
+        // row of other player buttons.
+        //
+        // It is deliberately NOT tied to the controls' auto-hide: the device popup lives inside
+        // this button, and discovery runs while the popup is open and stops when it is removed.
+        // Hiding the button with the controls would close the popup a few seconds in, before the
+        // scan finishes, and no device would ever show up.
+        if (!isInPip && !runtime.playerControlsLocked) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .windowInsetsPadding(WindowInsets.safeContent.only(WindowInsetsSides.Top))
+                    .padding(
+                        end = horizontalSafePadding + metrics.horizontalPadding,
+                        top = metrics.verticalPadding + 56.dp,
+                    )
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.35f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                PlatformCastButton(
+                    request = {
+                        val url = if (runtime.activeTorrentInfoHash != null) {
+                            runtime.p2pResolvedSourceUrl
+                        } else {
+                            runtime.activeSourceUrl
+                        }
+                        url?.takeIf { it.isNotBlank() }?.let {
+                            PlayerCastRequest(
+                                url = it,
+                                title = runtime.title,
+                                headers = runtime.activeSourceHeaders.orEmpty(),
+                                posterUrl = runtime.poster ?: runtime.background,
+                                positionMs = runtime.playbackSnapshot.positionMs,
+                                durationMs = runtime.playbackSnapshot.durationMs,
+                            )
+                        }
+                    },
+                    // The receiver takes over, so stop playing on the phone.
+                    onCastRequested = { runtime.shouldPlay = false },
+                    modifier = Modifier,
+                )
+            }
+        }
     }
 }
