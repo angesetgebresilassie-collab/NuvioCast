@@ -5,8 +5,12 @@ on:
     branches: [cast-engine]
   workflow_dispatch:
     inputs:
+      arm64_only:
+        description: "Only include arm64 native libraries (much smaller APK). Off = same build as the last known-good one."
+        type: boolean
+        default: false
       variant:
-        description: "debug = the normal build (default). benchmark = minified with R8, smaller but riskier."
+        description: "debug = the normal build. benchmark = minified with R8 (smaller, riskier)."
         type: choice
         options: [debug, benchmark]
         default: debug
@@ -20,7 +24,7 @@ concurrency:
 
 jobs:
   full-build:
-    name: Build full APK (arm64)
+    name: Build full APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -59,20 +63,20 @@ jobs:
             touch local.properties
           fi
 
-      # The only size change in the default build is dropping the native libraries of other
-      # CPU architectures (arm64-v8a is what phones use). No code is removed or renamed, so
-      # the app behaves exactly like the plain debug build.
       # gradle.properties asks for a 12 GB Gradle daemon plus an 8 GB Kotlin daemon, more than
-      # the 16 GB runner has, so Kotlin runs inside one 7 GB daemon instead.
+      # the 16 GB runner has, so Kotlin runs inside one 7 GB daemon instead (build speed only).
       - name: Build APK
         env:
           VARIANT: ${{ inputs.variant || 'debug' }}
+          ARM64_ONLY: ${{ inputs.arm64_only || 'false' }}
         run: |
           TASK="assembleFull$(echo "${VARIANT:0:1}" | tr a-z A-Z)${VARIANT:1}"
+          ABI_ARG=""
+          if [ "$ARM64_ONLY" = "true" ]; then ABI_ARG="-Pnuvio.abiFilter=arm64-v8a"; fi
           ./gradlew ":androidApp:${TASK}" \
             -Pnuvio.android.distribution=full \
             -Pnuvio.ios.distribution=appstore \
-            -Pnuvio.abiFilter=arm64-v8a \
+            $ABI_ARG \
             -Pkotlin.compiler.execution.strategy=in-process \
             "-Dorg.gradle.jvmargs=-Xmx7g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8" \
             --parallel --stacktrace
@@ -85,7 +89,6 @@ jobs:
           echo "APK=$APK" >> "$GITHUB_ENV"
           ls -lh "$APK"
           echo "### APK size: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
-          # Same fingerprint on every run means in-place updates work.
           keytool -printcert -jarfile "$APK" | grep "SHA256:" | tee -a "$GITHUB_STEP_SUMMARY" || true
 
       - name: Upload APK
