@@ -210,23 +210,20 @@ internal fun PlayerScreenContent(args: PlayerScreenArgs) {
             dockPartyPanel = dockPartyPanel,
         )
 
-        // Cast button (Android draws it, other platforms draw nothing). It sits with the other
-        // player controls: shown with them, hidden while locked or in picture-in-picture.
-        val legacyLayout = playerSettingsUiState.useLegacyPlayerLayout
+        // Cast button (Android draws it, other platforms draw nothing). Top right, just below the
+        // row of other player buttons; shown with the controls, hidden while locked or in PiP.
         AnimatedVisibility(
             visible = runtime.controlsVisible && !runtime.playerControlsLocked && !isInPip,
             enter = fadeIn(),
             exit = fadeOut(),
-            modifier = Modifier.align(if (legacyLayout) Alignment.TopEnd else Alignment.TopStart),
+            modifier = Modifier.align(Alignment.TopEnd),
         ) {
             Box(
                 modifier = Modifier
                     .windowInsetsPadding(WindowInsets.safeContent.only(WindowInsetsSides.Top))
                     .padding(
-                        start = horizontalSafePadding + metrics.horizontalPadding,
                         end = horizontalSafePadding + metrics.horizontalPadding,
-                        // The legacy header puts its own icons along the top edge; sit below them.
-                        top = if (legacyLayout) 72.dp else metrics.verticalPadding / 4,
+                        top = metrics.verticalPadding + 56.dp,
                     )
                     .size(48.dp)
                     .clip(CircleShape)
