@@ -29,6 +29,14 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # Every CI run starts on a fresh machine, and Android generates a brand-new random debug
+      # key on a fresh machine, so each APK used to be signed differently and could not be
+      # installed over the previous one. One fixed debug key makes every build an in-place update.
+      - name: Install fixed debug signing key
+        run: |
+          mkdir -p "$HOME/.android"
+          base64 --decode .github/debug.keystore.b64 > "$HOME/.android/debug.keystore"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
