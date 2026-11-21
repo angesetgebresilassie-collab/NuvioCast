@@ -57,12 +57,6 @@
 -keep class is.xyz.mpv.** { *; }
 -keep interface is.xyz.mpv.** { *; }
 
-# Cast engine: DLNA/Chromecast sessions, the local media server and the FFmpeg audio remux.
-# Kept whole so minified builds behave exactly like debug builds.
--keep class com.nuvio.app.features.cast.** { *; }
--keep class com.nuvio.app.features.player.PlayerCastKt { *; }
--keep class com.nuvio.app.features.player.PlayerCast_androidKt { *; }
-
 # FFmpegKit (cast audio track remux) is called from JNI.
 -keep class com.arthenica.ffmpegkit.** { *; }
 -keep class com.arthenica.smartexception.** { *; }
