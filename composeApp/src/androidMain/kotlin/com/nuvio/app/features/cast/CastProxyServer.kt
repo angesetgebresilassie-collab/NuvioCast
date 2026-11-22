@@ -15,6 +15,10 @@ import java.util.concurrent.Executors
 
 private const val DLNA_FEATURES = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
+/** Remuxed MKV is a live stream: no byte ranges, flagged as converted content. */
+internal const val DLNA_REMUX_FEATURES = "DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+internal const val REMUX_MIME = "video/x-matroska"
+
 internal fun guessMimeFromUrl(url: String): String? {
     val path = url.substringBefore('?').substringBefore('#').lowercase()
     return when {
@@ -57,11 +61,21 @@ private fun fileNameFor(url: String, mime: String): String {
  * every redirect, often can't do HTTPS and can't reach 127.0.0.1 (torrent/local streams), so the
  * renderer is pointed at this relay instead. It supports Range requests (seeking) and rewrites
  * HLS playlists so every segment also goes through the relay.
+ *
+ * It can also serve a source as a freshly remuxed MKV with a chosen audio track ([registerRemux]).
  */
 internal class CastProxyServer {
     private class Source(val url: String, val headers: Map<String, String>, val mime: String)
 
+    private class RemuxSource(
+        val url: String,
+        val headers: Map<String, String>,
+        val audioIndex: Int,
+        val startMs: Long,
+    )
+
     private val sources = ConcurrentHashMap<String, Source>()
+    private val remuxes = ConcurrentHashMap<String, RemuxSource>()
     private val executor = Executors.newCachedThreadPool()
 
     @Volatile
@@ -74,8 +88,24 @@ internal class CastProxyServer {
         return "http://$host:$port/s/$token/${fileNameFor(url, mime)}"
     }
 
+    /** Serves [url] as MKV (video + the [audioIndex]-th audio track), starting at [startMs]. */
+    fun registerRemux(
+        url: String,
+        headers: Map<String, String>,
+        host: String,
+        audioIndex: Int,
+        startMs: Long,
+    ): String {
+        val port = ensureStarted()
+        val token = newToken()
+        remuxes.clear()
+        remuxes[token] = RemuxSource(url, headers, audioIndex, startMs)
+        return "http://$host:$port/r/$token/video.mkv"
+    }
+
     fun clear() {
         sources.clear()
+        remuxes.clear()
         runCatching { serverSocket?.close() }
         serverSocket = null
     }
@@ -133,6 +163,14 @@ internal class CastProxyServer {
                     val colon = line.indexOf(':')
                     if (colon > 0) headers[line.substring(0, colon).trim().lowercase()] = line.substring(colon + 1).trim()
                 }
+                if (method == "GET" || method == "HEAD") {
+                    val remuxToken = Regex("^/r/([0-9a-f]+)").find(path)?.groupValues?.get(1)
+                    val remux = remuxToken?.let { remuxes[it] }
+                    if (remux != null) {
+                        serveRemux(out, method, remux)
+                        return
+                    }
+                }
                 val token = Regex("^/s/([0-9a-f]+)").find(path)?.groupValues?.get(1)
                 val source = token?.let { sources[it] }
                 if (source == null || (method != "GET" && method != "HEAD")) {
@@ -152,6 +190,37 @@ internal class CastProxyServer {
     private fun writeStatusOnly(out: OutputStream, code: Int, reason: String) {
         out.write("HTTP/1.1 $code $reason\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
         out.flush()
+    }
+
+    private fun serveRemux(out: OutputStream, method: String, source: RemuxSource) {
+        val head = "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: $REMUX_MIME\r\n" +
+            "Accept-Ranges: none\r\n" +
+            "transferMode.dlna.org: Streaming\r\n" +
+            "contentFeatures.dlna.org: $DLNA_REMUX_FEATURES\r\n" +
+            "Connection: close\r\n\r\n"
+        if (method == "HEAD") {
+            out.write(head.toByteArray())
+            out.flush()
+            return
+        }
+        val remuxer = MkvAudioRemuxer(source.url, source.headers, source.audioIndex, source.startMs)
+        try {
+            try {
+                remuxer.open()
+            } catch (e: Exception) {
+                writeStatusOnly(out, 502, "Bad Gateway")
+                return
+            }
+            out.write(head.toByteArray())
+            remuxer.stream(out)
+        } catch (e: IOException) {
+            // Renderer stopped reading (seek, stop, new session): nothing to do.
+        } catch (e: RuntimeException) {
+            // Source stopped mid-stream: end the response.
+        } finally {
+            remuxer.close()
+        }
     }
 
     private fun reasonFor(code: Int) = when (code) {
