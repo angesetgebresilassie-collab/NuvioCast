@@ -19,11 +19,8 @@ import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContent
 import androidx.compose.foundation.layout.width
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Cast
-import androidx.compose.material.icons.rounded.CastConnected
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -31,7 +28,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -40,10 +36,33 @@ import com.nuvio.app.features.cast.CastPopup
 import com.nuvio.app.features.cast.CastRenderer
 import com.nuvio.app.features.cast.CastStatus
 import com.nuvio.app.features.cast.rememberCastEngine
+import kotlinx.coroutines.delay
 
 /**
- * Cast button + popup drawn on top of the player. The button sits in the top-right under the toolbar
- * buttons, follows the controls' visibility and tints when a renderer is playing.
+ * Shared state between the cast button in the player's top toolbar ([PlayerToolbar]) and the popup drawn
+ * by [RenderCastOverlay]. There is only ever one player screen, so a small holder keeps the two in sync
+ * without threading parameters through every control layout.
+ */
+internal object CastPopupState {
+    /** The popup is showing. */
+    var open by mutableStateOf(false)
+
+    /** A source is castable right now, so the toolbar should show the cast button. */
+    var available by mutableStateOf(false)
+
+    /** A renderer is currently playing, so the cast button is tinted/connected. */
+    var active by mutableStateOf(false)
+
+    fun reset() {
+        open = false
+        available = false
+        active = false
+    }
+}
+
+/**
+ * Cast popup drawn on top of the player. The cast button itself lives in the top toolbar next to the
+ * other buttons; tapping it toggles [CastPopupState.open], and the popup hangs just below the toolbar.
  */
 @Composable
 internal fun PlayerScreenRuntime.RenderCastOverlay() {
@@ -52,7 +71,7 @@ internal fun PlayerScreenRuntime.RenderCastOverlay() {
     val discovering by engine.isDiscovering.collectAsStateWithLifecycle()
     val session by engine.session.collectAsStateWithLifecycle()
     val isInPip = rememberIsInPictureInPicture()
-    var open by remember { mutableStateOf(false) }
+    val open = CastPopupState.open
 
     val sourceUrl: String? = if (activeTorrentInfoHash != null) p2pResolvedSourceUrl else activeSourceUrl
     val tracks = serverAudioTracks.ifEmpty { audioTracks }
@@ -60,23 +79,34 @@ internal fun PlayerScreenRuntime.RenderCastOverlay() {
     val selectedPosition = session.audioTrackPosition
         ?: tracks.indexOfFirst { it.index == localSelectedIndex }.coerceAtLeast(0)
 
-    val showButton = sourceUrl != null && (controlsVisible || open) && !playerControlsLocked && !isInPip
+    val available = sourceUrl != null && !playerControlsLocked && !isInPip
 
+    DisposableEffect(Unit) {
+        onDispose { CastPopupState.reset() }
+    }
+    LaunchedEffect(available, session.isActive) {
+        CastPopupState.available = available
+        CastPopupState.active = session.isActive
+        if (!available) CastPopupState.open = false
+    }
     LaunchedEffect(open) {
         if (open) engine.startDiscovery()
     }
-    LaunchedEffect(showButton) {
-        if (!showButton) open = false
+    // Keep the controls (and the toolbar with the cast button) on screen while the popup is open.
+    LaunchedEffect(open) {
+        while (open) {
+            controlsActivityTick += 1
+            delay(2_000L)
+        }
     }
 
-    if (!showButton) return
+    if (!available) return
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        val buttonSize = metrics.headerIconSize + 16.dp
         val topInset = WindowInsets.safeContent.only(WindowInsetsSides.Top).asPaddingValues().calculateTopPadding()
         val endPadding = horizontalSafePadding + metrics.horizontalPadding
-        val buttonTop = topInset + metrics.verticalPadding / 4 + buttonSize + 10.dp
-        val popupTop = buttonTop + buttonSize + 8.dp
+        val toolbarHeight = maxOf(48.dp, metrics.headerIconSize + 16.dp)
+        val popupTop = topInset + metrics.verticalPadding / 4 + toolbarHeight + 8.dp
 
         if (open) {
             Box(
@@ -85,25 +115,7 @@ internal fun PlayerScreenRuntime.RenderCastOverlay() {
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
-                    ) { open = false },
-            )
-        }
-
-        Box(
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .padding(end = endPadding, top = buttonTop),
-        ) {
-            PlayerHeaderIconButton(
-                icon = if (session.isActive) Icons.Rounded.CastConnected else Icons.Rounded.Cast,
-                contentDescription = "Cast",
-                buttonSize = buttonSize,
-                iconSize = metrics.headerIconSize,
-                onClick = {
-                    open = !open
-                    controlsActivityTick += 1
-                },
-                tint = if (session.isActive) MaterialTheme.colorScheme.primary else Color.White,
+                    ) { CastPopupState.open = false },
             )
         }
 
@@ -162,7 +174,7 @@ internal fun PlayerScreenRuntime.RenderCastOverlay() {
                     engine.stop()
                     if (resumeMs > 0L) playerController?.seekTo(resumeMs)
                     shouldPlay = true
-                    open = false
+                    CastPopupState.open = false
                 },
                 modifier = Modifier
                     .width(minOf(340.dp, maxWidth - endPadding - 16.dp))
