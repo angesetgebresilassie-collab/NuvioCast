@@ -10,6 +10,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -31,6 +32,7 @@ import java.net.URL
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 private const val SSDP_ADDRESS = "239.255.255.250"
 private const val SSDP_PORT = 1900
@@ -82,7 +84,9 @@ actual fun rememberCastEngine(): CastEngine {
 internal class UpnpCastEngine private constructor(private val appContext: Context) : CastEngine {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val devices = ConcurrentHashMap<String, UpnpDevice>()
-    private val proxy = CastProxyServer()
+
+    @Volatile
+    private var proxy = CastProxyServer()
 
     private val rendererState = MutableStateFlow<List<CastRenderer>>(emptyList())
     private val sessionState = MutableStateFlow(CastSessionState())
@@ -245,17 +249,19 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
             sessionState.value = CastSessionState(renderer = device.renderer, status = CastStatus.Connecting)
             try {
                 val (playUrl, mime) = prepare(media, device)
-                runCatching { control(device.avTransport, "Stop", INSTANCE) }
-                control(
-                    device.avTransport,
-                    "SetAVTransportURI",
-                    listOf(
-                        "InstanceID" to "0",
-                        "CurrentURI" to playUrl,
-                        "CurrentURIMetaData" to buildDidl(media.title, playUrl, mime),
-                    ),
-                )
-                control(device.avTransport, "Play", listOf("InstanceID" to "0", "Speed" to "1"))
+                stopAndWait(device)
+                retrying {
+                    control(
+                        device.avTransport,
+                        "SetAVTransportURI",
+                        listOf(
+                            "InstanceID" to "0",
+                            "CurrentURI" to playUrl,
+                            "CurrentURIMetaData" to buildDidl(media.title, playUrl, mime),
+                        ),
+                    )
+                }
+                retrying { control(device.avTransport, "Play", listOf("InstanceID" to "0", "Speed" to "1")) }
                 loadCapabilities(device)
                 // Always switchable: a UPnP audio action when the renderer has one, otherwise the MKV remux.
                 sessionState.update { it.copy(audioSwitchSupported = true) }
@@ -339,14 +345,41 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
 
     override fun seekTo(positionMs: Long) = act { device ->
         val media = lastMedia
+        val target = positionMs.coerceAtLeast(0L)
         if (remuxActive && media != null) {
             // The remuxed MKV is a live stream with no byte ranges, so seeking restarts it at the new spot.
-            remuxCast(device, media, remuxAudioIndex, positionMs.coerceAtLeast(0L))
+            remuxCast(device, media, remuxAudioIndex, target)
         } else {
-            seekInternal(device, positionMs)
-            sessionState.update { it.copy(positionMs = positionMs) }
+            sessionState.update { it.copy(positionMs = target) }
+            if (!trySeek(device, target) && media != null) {
+                // The renderer ignored or refused the seek: restart the stream from the phone at the new spot.
+                remuxCast(device, media, sessionState.value.audioTrackPosition ?: 0, target)
+            }
         }
     }
+
+    /** Tries a UPnP seek (relative, then absolute time) and checks the renderer really moved. */
+    private suspend fun trySeek(device: UpnpDevice, targetMs: Long): Boolean {
+        for (unit in listOf("REL_TIME", "ABS_TIME")) {
+            val accepted = runCatching {
+                control(
+                    device.avTransport,
+                    "Seek",
+                    listOf("InstanceID" to "0", "Unit" to unit, "Target" to formatTime(targetMs)),
+                )
+            }.isSuccess
+            if (!accepted) continue
+            delay(1_500L)
+            val actual = readPositionMs(device) ?: return true // position not reported: trust the renderer
+            if (abs(actual - targetMs) <= 8_000L) return true
+        }
+        return false
+    }
+
+    private fun readPositionMs(device: UpnpDevice): Long? = runCatching {
+        val rel = tag(control(device.avTransport, "GetPositionInfo", INSTANCE), "RelTime")
+        if (rel.isNullOrBlank() || rel == "NOT_IMPLEMENTED") null else parseTime(rel)
+    }.getOrNull()
 
     override fun setVolume(percent: Int) = act { device ->
         val rendering = device.rendering ?: return@act
@@ -409,17 +442,19 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
                 val ip = localAddressFor(device.host)
                     ?: throw IOException("Couldn't find this phone's Wi-Fi address. Are you on the same network?")
                 val playUrl = proxy.registerRemux(media.url, media.headers, ip, audioIndex, startMs)
-                runCatching { control(device.avTransport, "Stop", INSTANCE) }
-                control(
-                    device.avTransport,
-                    "SetAVTransportURI",
-                    listOf(
-                        "InstanceID" to "0",
-                        "CurrentURI" to playUrl,
-                        "CurrentURIMetaData" to buildDidl(media.title, playUrl, REMUX_MIME, DLNA_REMUX_FEATURES),
-                    ),
-                )
-                control(device.avTransport, "Play", listOf("InstanceID" to "0", "Speed" to "1"))
+                stopAndWait(device)
+                retrying {
+                    control(
+                        device.avTransport,
+                        "SetAVTransportURI",
+                        listOf(
+                            "InstanceID" to "0",
+                            "CurrentURI" to playUrl,
+                            "CurrentURIMetaData" to buildDidl(media.title, playUrl, REMUX_MIME, DLNA_REMUX_FEATURES),
+                        ),
+                    )
+                }
+                retrying { control(device.avTransport, "Play", listOf("InstanceID" to "0", "Speed" to "1")) }
                 remuxActive = true
                 remuxOffsetMs = startMs
                 remuxAudioIndex = audioIndex
@@ -434,6 +469,10 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
         }
     }
 
+    /**
+     * Disconnects and rebuilds the whole engine: ends the session, drops every cached renderer and the
+     * relay, then starts discovery again from scratch so the next cast begins clean.
+     */
     override fun stop() {
         val device = activeDevice
         castJob?.cancel()
@@ -442,14 +481,24 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
         lastMedia = null
         remuxActive = false
         remuxOffsetMs = 0L
-        proxy.clear()
+        remuxAudioIndex = 0
         sessionState.value = CastSessionState()
-        if (device != null) {
-            scope.launch { runCatching { control(device.avTransport, "Stop", INSTANCE) } }
+        val oldProxy = proxy
+        proxy = CastProxyServer()
+        val oldDiscovery = discoveryJob
+        discoveryJob = null
+        scope.launch {
+            if (device != null) runCatching { control(device.avTransport, "Stop", INSTANCE) }
+            runCatching { oldProxy.clear() }
+            runCatching { oldDiscovery?.cancelAndJoin() }
+            devices.clear()
+            rendererState.value = emptyList()
+            discoveringState.value = false
+            startDiscovery()
         }
     }
 
-    private fun act(block: (UpnpDevice) -> Unit) {
+    private fun act(block: suspend (UpnpDevice) -> Unit) {
         val device = activeDevice ?: return
         scope.launch {
             try {
@@ -459,6 +508,34 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
             } catch (e: Exception) {
                 sessionState.update { it.copy(notice = e.message) }
             }
+        }
+    }
+
+    /** Renderers often refuse a command while still switching state, so retry a few times. */
+    private suspend fun <T> retrying(attempts: Int = 4, delayMs: Long = 700L, block: () -> T): T {
+        var last: Exception? = null
+        for (attempt in 1..attempts) {
+            try {
+                return block()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                last = e
+                if (attempt < attempts) delay(delayMs)
+            }
+        }
+        throw last ?: IOException("The renderer didn't respond.")
+    }
+
+    /** Stops playback and waits (briefly) until the renderer reports it is idle before loading new media. */
+    private suspend fun stopAndWait(device: UpnpDevice) {
+        runCatching { control(device.avTransport, "Stop", INSTANCE) }
+        repeat(10) {
+            val state = runCatching {
+                tag(control(device.avTransport, "GetTransportInfo", INSTANCE), "CurrentTransportState")?.uppercase()
+            }.getOrNull()
+            if (state == null || state == "STOPPED" || state == "NO_MEDIA_PRESENT") return
+            delay(300L)
         }
     }
 
@@ -474,6 +551,7 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
         pollJob?.cancel()
         pollJob = scope.launch {
             var failures = 0
+            var reconnecting = false
             var pendingSeek: Long? = startPositionMs.takeIf { it > 3_000L }
             val volume = readVolume(device)
             if (volume != null) sessionState.update { it.copy(volume = volume) }
@@ -482,6 +560,12 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
                     val transport = control(device.avTransport, "GetTransportInfo", INSTANCE)
                     val position = control(device.avTransport, "GetPositionInfo", INSTANCE)
                     failures = 0
+                    if (reconnecting) {
+                        reconnecting = false
+                        sessionState.update {
+                            if (it.notice?.startsWith("Reconnecting") == true) it.copy(notice = null) else it
+                        }
+                    }
                     val status = when (tag(transport, "CurrentTransportState")?.uppercase()) {
                         "PLAYING" -> CastStatus.Playing
                         "PAUSED_PLAYBACK", "PAUSED_RECORDING" -> CastStatus.Paused
@@ -509,14 +593,20 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
                     throw e
                 } catch (e: Exception) {
                     failures++
-                    if (failures >= 5) {
+                    if (failures >= 5 && !reconnecting) {
+                        reconnecting = true
+                        sessionState.update {
+                            it.copy(status = CastStatus.Buffering, notice = "Reconnecting to the renderer…")
+                        }
+                    }
+                    if (failures >= 40) {
                         sessionState.update {
                             it.copy(status = CastStatus.Error, notice = "Lost connection to the renderer.")
                         }
                         break
                     }
                 }
-                delay(1_000L)
+                delay(if (failures >= 5) 2_000L else 1_000L)
             }
         }
     }
