@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit
  *  - [cast] to connect to a device and load media
  *  - the transport/volume/audio functions to control the active session
  *  - [state] to render it
+ *  - [discoveryLog] to show what discovery is doing (the popup prints it)
  *
  * Protocols are pluggable: each one provides a discovery source and a [CastSession]. DLNA and
  * Chromecast are implemented; adding another (AirPlay, Roku ECP, ...) means adding a
@@ -41,7 +42,6 @@ object CastManager {
 
     private var server: LocalMediaServer? = null
     private var multicastLock: WifiManager.MulticastLock? = null
-    private var dlnaDiscovery: DlnaDiscovery? = null
     private var chromecastDiscovery: ChromecastDiscovery? = null
     private var scanJob: Job? = null
 
@@ -58,6 +58,11 @@ object CastManager {
     private val _state = MutableStateFlow(CastSessionState())
     val state: StateFlow<CastSessionState> = _state.asStateFlow()
 
+    // What discovery is doing, newest state per topic, shown in the popup.
+    private val logLines = LinkedHashMap<String, String>()
+    private val _discoveryLog = MutableStateFlow<List<String>>(emptyList())
+    val discoveryLog: StateFlow<List<String>> = _discoveryLog.asStateFlow()
+
     private var session: CastSession? = null
     private var sessionJob: Job? = null
 
@@ -65,28 +70,49 @@ object CastManager {
         appContext = context.applicationContext
     }
 
+    private fun note(key: String, text: String) {
+        synchronized(logLines) {
+            logLines[key] = text
+            _discoveryLog.value = logLines.values.toList().takeLast(8)
+        }
+    }
+
+    private fun clearLog() {
+        synchronized(logLines) {
+            logLines.clear()
+            _discoveryLog.value = emptyList()
+        }
+    }
+
     // ---- discovery ---------------------------------------------------------------------------------
 
     @Synchronized
     fun startDiscovery() {
-        val ctx = appContext ?: return
+        val ctx = appContext
+        if (ctx == null) {
+            note("init", "Cast is not initialised (CastManager.init was not called)")
+            return
+        }
         if (scanJob?.isActive == true) return
+        clearLog()
 
+        // Without this lock many phones drop incoming multicast/SSDP traffic to save battery.
         runCatching {
             val wifi = ctx.getSystemService(Context.WIFI_SERVICE) as? WifiManager
             multicastLock = wifi?.createMulticastLock("nuviocast-discovery")?.apply {
                 setReferenceCounted(false)
                 acquire()
             }
-        }
+        }.onFailure { note("lock", "Could not hold the Wi-Fi multicast lock: ${it.message}") }
 
         val chromecast = ChromecastDiscovery(ctx).also { chromecastDiscovery = it }
         chromecast.start { list ->
             chromecastFound = list
+            note("chromecast", "Chromecast: ${list.size} found")
             publish()
         }
 
-        val dlna = DlnaDiscovery(http).also { dlnaDiscovery = it }
+        val dlna = SsdpDiscovery(http) { key, text -> note(key, text) }
         _scanning.value = true
         scanJob = scope.launch {
             try {
@@ -96,8 +122,8 @@ object CastManager {
                             dlnaFound[device.id] = device
                             publish()
                         }
-                    }
-                    delay(2_000)
+                    }.onFailure { note("error", "Search failed: ${it.message}") }
+                    delay(1_500)
                 }
             } finally {
                 _scanning.value = false
