@@ -19,6 +19,8 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.automirrored.rounded.Toc
 import androidx.compose.material.icons.rounded.Build
+import androidx.compose.material.icons.rounded.Cast
+import androidx.compose.material.icons.rounded.CastConnected
 import androidx.compose.material.icons.rounded.Flag
 import androidx.compose.material.icons.rounded.Groups
 import androidx.compose.material.icons.rounded.Info
@@ -68,6 +70,14 @@ internal fun PlayerToolbar(
 ) {
     Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Spacer(Modifier.weight(1f))
+        if (CastPopupState.available) {
+            PlayerAction(
+                description = "Cast",
+                icon = if (CastPopupState.active) Icons.Rounded.CastConnected else Icons.Rounded.Cast,
+                onClick = { CastPopupState.open = !CastPopupState.open },
+                tint = if (CastPopupState.active) MaterialTheme.colorScheme.primary else Color.White,
+            )
+        }
         if (onSwitchEngineClick != null) {
             PlayerAction(
                 description = stringResource(Res.string.cd_switch_player_engine),
