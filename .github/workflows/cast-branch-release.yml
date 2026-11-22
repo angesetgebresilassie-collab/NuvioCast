@@ -1,0 +1,103 @@
+name: Cast Branch Release Build
+
+# Shrunk (R8 minify + resource shrinking) release APK for the feature/upnp-cast branch.
+# - With release signing secrets configured: signed `assembleFullRelease`.
+# - Without them: `assembleFullBenchmark`, the same R8-shrunk build but debug-signed so it installs.
+# Runs when this file changes (so pushing it kicks off a build) and on demand from the Actions tab.
+
+on:
+  push:
+    branches: [feature/upnp-cast]
+    paths: [".github/workflows/cast-branch-release.yml"]
+  workflow_dispatch:
+    inputs:
+      abis:
+        description: Comma-separated ABIs to package (arm64-v8a is enough for almost every phone)
+        required: false
+        default: arm64-v8a
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cast-branch-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-build:
+    name: Build shrunk release APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Prepare runtime properties and signing
+        id: signing
+        env:
+          LOCAL_PROPERTIES_BASE64: ${{ secrets.NUVIO_LOCAL_PROPERTIES_BASE64 }}
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.NUVIO_RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$LOCAL_PROPERTIES_BASE64" ]; then
+            printf '%s' "$LOCAL_PROPERTIES_BASE64" | base64 --decode > local.properties
+            sed -i -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' local.properties
+          else
+            touch local.properties
+          fi
+
+          signed=false
+          if [ -n "$RELEASE_KEYSTORE_BASE64" ] \
+            && grep -Eq '^NUVIO_RELEASE_STORE_PASSWORD=.+' local.properties \
+            && grep -Eq '^NUVIO_RELEASE_KEY_ALIAS=.+' local.properties \
+            && grep -Eq '^NUVIO_RELEASE_KEY_PASSWORD=.+' local.properties; then
+            keystore_path="${RUNNER_TEMP}/nuvio-release.jks"
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > "${keystore_path}"
+            printf '\nNUVIO_RELEASE_STORE_FILE=%s\n' "${keystore_path}" >> local.properties
+            signed=true
+          fi
+
+          if [ "$signed" = "true" ]; then
+            echo "task=assembleFullRelease" >> "$GITHUB_OUTPUT"
+            echo "dir=release" >> "$GITHUB_OUTPUT"
+            echo "label=signed release" >> "$GITHUB_OUTPUT"
+          else
+            echo "task=assembleFullBenchmark" >> "$GITHUB_OUTPUT"
+            echo "dir=benchmark" >> "$GITHUB_OUTPUT"
+            echo "label=R8-shrunk, debug-signed (no release keystore configured)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build shrunk APK
+        env:
+          ABIS: ${{ inputs.abis || 'arm64-v8a' }}
+        run: >
+          ./gradlew :androidApp:${{ steps.signing.outputs.task }}
+          -Pnuvio.android.distribution=full
+          -Pnuvio.ios.distribution=appstore
+          -Pnuvio.abis="${ABIS}"
+          --stacktrace
+
+      - name: Report APK size
+        run: |
+          {
+            echo "### Cast branch APK (${{ steps.signing.outputs.label }})"
+            du -h androidApp/build/outputs/apk/full/${{ steps.signing.outputs.dir }}/*.apk
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK (max compression)
+        uses: actions/upload-artifact@v7
+        with:
+          name: androidApp-full-${{ steps.signing.outputs.dir }}
+          path: androidApp/build/outputs/apk/full/${{ steps.signing.outputs.dir }}/*.apk
+          compression-level: 9
+          if-no-files-found: error
+          retention-days: 14
