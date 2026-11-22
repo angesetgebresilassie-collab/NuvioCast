@@ -37,6 +37,8 @@ private const val SSDP_PORT = 1900
 private const val DISCOVERY_WINDOW_MS = 12_000L
 private const val AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:"
 private const val RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:"
+private const val DEFAULT_DLNA_FEATURES =
+    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 private val INSTANCE = listOf("InstanceID" to "0")
 private val AUDIO_ACTION = Regex("(?i)audio[_]?(track|stream)|^(set|select)audio$")
 
@@ -72,6 +74,10 @@ actual fun rememberCastEngine(): CastEngine {
 /**
  * UPnP/DLNA sender: SSDP discovery, AVTransport/RenderingControl SOAP control, and a phone-side relay
  * ([CastProxyServer]) for streams a renderer can't fetch on its own.
+ *
+ * Audio track switching: if the renderer exposes a UPnP audio action it is used; otherwise the phone
+ * remuxes the source to MKV with the chosen audio track ([MkvAudioRemuxer]) and recasts it from the
+ * current position.
  */
 internal class UpnpCastEngine private constructor(private val appContext: Context) : CastEngine {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -92,6 +98,19 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
 
     @Volatile
     private var activeDevice: UpnpDevice? = null
+
+    // What is being cast, and whether the renderer currently plays a phone-side MKV remux of it.
+    @Volatile
+    private var lastMedia: CastMedia? = null
+
+    @Volatile
+    private var remuxActive = false
+
+    @Volatile
+    private var remuxOffsetMs = 0L
+
+    @Volatile
+    private var remuxAudioIndex = 0
 
     // ---------------------------------------------------------------- discovery
 
@@ -219,6 +238,10 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
                 runCatching { control(previous.avTransport, "Stop", INSTANCE) }
             }
             activeDevice = device
+            lastMedia = media
+            remuxActive = false
+            remuxOffsetMs = 0L
+            remuxAudioIndex = 0
             sessionState.value = CastSessionState(renderer = device.renderer, status = CastStatus.Connecting)
             try {
                 val (playUrl, mime) = prepare(media, device)
@@ -234,7 +257,8 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
                 )
                 control(device.avTransport, "Play", listOf("InstanceID" to "0", "Speed" to "1"))
                 loadCapabilities(device)
-                sessionState.update { it.copy(audioSwitchSupported = device.audioAction != null) }
+                // Always switchable: a UPnP audio action when the renderer has one, otherwise the MKV remux.
+                sessionState.update { it.copy(audioSwitchSupported = true) }
                 startPolling(device, media.startPositionMs)
             } catch (e: CancellationException) {
                 throw e
@@ -271,15 +295,19 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
         type?.takeIf { it.startsWith("video/") || it.startsWith("audio/") }
     }.getOrNull()
 
-    private fun buildDidl(title: String, url: String, mime: String): String =
+    private fun buildDidl(
+        title: String,
+        url: String,
+        mime: String,
+        features: String = DEFAULT_DLNA_FEATURES,
+    ): String =
         "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
             "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
             "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
             "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
             "<dc:title>${xmlEscape(title)}</dc:title>" +
             "<upnp:class>object.item.videoItem</upnp:class>" +
-            "<res protocolInfo=\"http-get:*:$mime:DLNA.ORG_OP=01;DLNA.ORG_CI=0;" +
-            "DLNA.ORG_FLAGS=01700000000000000000000000000000\">${xmlEscape(url)}</res>" +
+            "<res protocolInfo=\"http-get:*:$mime:$features\">${xmlEscape(url)}</res>" +
             "</item></DIDL-Lite>"
 
     private fun localAddressFor(remoteHost: String): String? {
@@ -310,8 +338,14 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
     }
 
     override fun seekTo(positionMs: Long) = act { device ->
-        seekInternal(device, positionMs)
-        sessionState.update { it.copy(positionMs = positionMs) }
+        val media = lastMedia
+        if (remuxActive && media != null) {
+            // The remuxed MKV is a live stream with no byte ranges, so seeking restarts it at the new spot.
+            remuxCast(device, media, remuxAudioIndex, positionMs.coerceAtLeast(0L))
+        } else {
+            seekInternal(device, positionMs)
+            sessionState.update { it.copy(positionMs = positionMs) }
+        }
     }
 
     override fun setVolume(percent: Int) = act { device ->
@@ -329,7 +363,10 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
         val device = activeDevice ?: return
         val action = device.audioAction
         if (action == null) {
-            sessionState.update { it.copy(notice = "This renderer can't switch audio tracks remotely.") }
+            // No UPnP audio action: remux to MKV with the chosen track and continue from the current position.
+            val media = lastMedia ?: return
+            val resumeAt = sessionState.value.positionMs.coerceAtLeast(0L)
+            remuxCast(device, media, position, resumeAt)
             return
         }
         scope.launch {
@@ -348,11 +385,63 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
         }
     }
 
+    /**
+     * Recasts [media] as an MKV that carries only the [audioIndex]-th audio track, starting at [startMs].
+     * The remux is produced on demand by [CastProxyServer] when the renderer fetches the URL.
+     */
+    private fun remuxCast(device: UpnpDevice, media: CastMedia, audioIndex: Int, startMs: Long) {
+        if (guessMimeFromUrl(media.url) == "application/vnd.apple.mpegurl") {
+            sessionState.update { it.copy(notice = "Audio switching isn't available for HLS streams.") }
+            return
+        }
+        castJob?.cancel()
+        pollJob?.cancel()
+        castJob = scope.launch {
+            sessionState.update {
+                it.copy(
+                    status = CastStatus.Buffering,
+                    positionMs = startMs,
+                    audioTrackPosition = audioIndex,
+                    notice = null,
+                )
+            }
+            try {
+                val ip = localAddressFor(device.host)
+                    ?: throw IOException("Couldn't find this phone's Wi-Fi address. Are you on the same network?")
+                val playUrl = proxy.registerRemux(media.url, media.headers, ip, audioIndex, startMs)
+                runCatching { control(device.avTransport, "Stop", INSTANCE) }
+                control(
+                    device.avTransport,
+                    "SetAVTransportURI",
+                    listOf(
+                        "InstanceID" to "0",
+                        "CurrentURI" to playUrl,
+                        "CurrentURIMetaData" to buildDidl(media.title, playUrl, REMUX_MIME, DLNA_REMUX_FEATURES),
+                    ),
+                )
+                control(device.avTransport, "Play", listOf("InstanceID" to "0", "Speed" to "1"))
+                remuxActive = true
+                remuxOffsetMs = startMs
+                remuxAudioIndex = audioIndex
+                startPolling(device, 0L)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                sessionState.update {
+                    it.copy(status = CastStatus.Error, notice = e.message ?: "Couldn't switch the audio track")
+                }
+            }
+        }
+    }
+
     override fun stop() {
         val device = activeDevice
         castJob?.cancel()
         pollJob?.cancel()
         activeDevice = null
+        lastMedia = null
+        remuxActive = false
+        remuxOffsetMs = 0L
         proxy.clear()
         sessionState.value = CastSessionState()
         if (device != null) {
@@ -404,8 +493,11 @@ internal class UpnpCastEngine private constructor(private val appContext: Contex
                         runCatching { seekInternal(device, target) }
                         pendingSeek = null
                     }
-                    val positionMs = parseTime(tag(position, "RelTime"))
-                    val durationMs = parseTime(tag(position, "TrackDuration"))
+                    // A remux restarts its timeline at 0, so add back where in the video it began.
+                    val offset = if (remuxActive) remuxOffsetMs else 0L
+                    val positionMs = parseTime(tag(position, "RelTime")) + offset
+                    val reportedDuration = parseTime(tag(position, "TrackDuration"))
+                    val durationMs = if (reportedDuration > 0L) reportedDuration + offset else 0L
                     sessionState.update { current ->
                         if (current.renderer?.id == device.renderer.id) {
                             current.copy(status = status, positionMs = positionMs, durationMs = durationMs)
